@@ -1,0 +1,119 @@
+name: Nightly Build and Deploy to QA
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 2 AM daily
+  workflow_dispatch:  # Manual trigger
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: color-app
+  QA_EC2_HOST: ${{ secrets.QA_EC2_HOST }}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          repository: jsrahoi-dev/devops-spring26-midterm-source
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: nightly-${{ github.run_number }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Run smoke tests locally
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: nightly-${{ github.run_number }}
+        run: |
+          # Start test database
+          docker run -d --name test-db \
+            -e MYSQL_ROOT_PASSWORD=test_password \
+            -e MYSQL_DATABASE=color_app \
+            mysql:8
+
+          # Wait for DB
+          sleep 20
+
+          # Start app container
+          docker run -d --name test-app \
+            --link test-db:db \
+            -e DB_HOST=db \
+            -e DB_USER=root \
+            -e DB_PASSWORD=test_password \
+            -e DB_NAME=color_app \
+            -e SESSION_SECRET=test_secret \
+            -p 3000:3000 \
+            $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          # Wait for app
+          sleep 10
+
+          # Run smoke tests
+          curl -f http://localhost:3000/api/health || exit 1
+          curl -s http://localhost:3000/ | grep -q '<!DOCTYPE html>' || exit 1
+
+          echo "Smoke tests passed!"
+
+      - name: Push image to ECR
+        if: success()
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: nightly-${{ github.run_number }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Deploy to QA EC2
+        if: success()
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: latest
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > private_key.pem
+          chmod 600 private_key.pem
+
+          # Copy deployment script
+          scp -i private_key.pem -o StrictHostKeyChecking=no \
+            scripts/deploy.sh ec2-user@${{ env.QA_EC2_HOST }}:/home/ec2-user/
+
+          # Run deployment
+          ssh -i private_key.pem -o StrictHostKeyChecking=no \
+            ec2-user@${{ env.QA_EC2_HOST }} \
+            "export ECR_REGISTRY=$ECR_REGISTRY && \
+             export ECR_REPOSITORY=$ECR_REPOSITORY && \
+             bash /home/ec2-user/deploy.sh $IMAGE_TAG"
+
+          # Verify deployment
+          ssh -i private_key.pem -o StrictHostKeyChecking=no \
+            ec2-user@${{ env.QA_EC2_HOST }} \
+            "curl -f http://localhost:3000/api/health"
+
+          rm -f private_key.pem
+
+      - name: Cleanup on failure
+        if: failure()
+        run: |
+          docker stop test-app test-db || true
+          docker rm test-app test-db || true
