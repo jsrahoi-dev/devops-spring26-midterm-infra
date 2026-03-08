@@ -276,7 +276,7 @@ jobs:
                 retries: 5
 
             app:
-              build: .
+              image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
               ports:
                 - "80:3000"
               environment:
@@ -291,14 +291,24 @@ jobs:
                   condition: service_healthy
           EOF
 
-          # Copy files to EC2
-          scp -i test-key.pem -o StrictHostKeyChecking=no -r source/* ec2-user@$PUBLIC_IP:~/app/
+          # Copy docker-compose file to EC2
           scp -i test-key.pem -o StrictHostKeyChecking=no docker-compose.test.yml ec2-user@$PUBLIC_IP:~/app/docker-compose.yml
 
+          
           # Deploy on EC2
-          ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP <<'ENDSSH'
+          ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP bash -s << ENDSSH ${{ steps.login-ecr.outputs.registry }} $ECR_REPOSITORY ${{ steps.version.outputs.IMAGE_TAG }}
+            ECR_REG=$1
+            ECR_REPO=$2
+            IMG_TAG=$3
             cd ~/app
-            sudo docker-compose up -d --build
+            # Login to ECR
+            aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin $ECR_REG
+            # Set environment variables and deploy
+            export ECR_REGISTRY=$ECR_REG
+            export ECR_REPOSITORY=$ECR_REPO
+            export IMAGE_TAG=$IMG_TAG
+            sudo -E docker-compose pull
+            sudo -E docker-compose up -d
             echo "⏳ Waiting for services to be healthy..."
             sleep 30
             sudo docker-compose ps
