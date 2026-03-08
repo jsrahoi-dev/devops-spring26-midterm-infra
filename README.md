@@ -1,5 +1,7 @@
 # DevOps Midterm - Infrastructure
 
+[![Integration Tests](https://github.com/jsrahoi-dev/devops-spring26-midterm-infra/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/jsrahoi-dev/devops-spring26-midterm-infra/actions/workflows/integration-tests.yml)
+
 Infrastructure automation and CI/CD workflows for Color Perception SPA deployment to AWS.
 
 ## Overview
@@ -18,6 +20,21 @@ This repository contains GitHub Actions workflows, deployment scripts, and infra
   - Temporary EC2 (nightly builds only)
 
 ## Workflows
+
+### Integration Tests (`integration-tests.yml`)
+- **Trigger:** Pull requests to main or manual dispatch
+- **Steps:**
+  1. Create temporary security group
+  2. Launch temporary EC2 instance
+  3. Deploy full application stack (app + MySQL)
+  4. Run unit and comprehensive API tests
+  5. Collect logs
+  6. Cleanup all temporary resources
+- **Features:**
+  - Tests against real infrastructure
+  - Full stack deployment validation
+  - Automatic PR comments with results
+  - Complete resource cleanup (always runs)
 
 ### Nightly Build (`nightly-build.yml`)
 - **Trigger:** Scheduled (2 AM daily) or manual dispatch
