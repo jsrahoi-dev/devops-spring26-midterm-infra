@@ -79,7 +79,7 @@ jobs:
           echo "sudo docker pull 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest" >> deploy.sh
           echo "sudo docker stop color-app 2>/dev/null || true" >> deploy.sh
           echo "sudo docker rm color-app 2>/dev/null || true" >> deploy.sh
-          echo "sudo docker run -d --name color-app -p 80:3000 -p 443:3000 -e DB_HOST=${{ secrets.DB_HOST }} -e DB_USER=${{ secrets.DB_USER }} -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} -e DB_NAME=${{ secrets.DB_NAME }} -e SESSION_SECRET=${{ secrets.SESSION_SECRET }} -e NODE_ENV=production --restart unless-stopped 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest" >> deploy.sh
+          echo "sudo docker run -d --name color-app -p 3000:3000 -e DB_HOST=${{ secrets.DB_HOST }} -e DB_USER=${{ secrets.DB_USER }} -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} -e DB_NAME=${{ secrets.DB_NAME }} -e SESSION_SECRET=${{ secrets.SESSION_SECRET }} -e NODE_ENV=production --restart unless-stopped 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest" >> deploy.sh
           scp -i key.pem -o StrictHostKeyChecking=no deploy.sh ec2-user@$QA_IP:/tmp/
           ssh -i key.pem -o StrictHostKeyChecking=no ec2-user@$QA_IP "bash /tmp/deploy.sh"
           rm -f key.pem
