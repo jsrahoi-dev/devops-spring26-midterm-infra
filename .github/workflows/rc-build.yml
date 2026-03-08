@@ -325,11 +325,9 @@ jobs:
             echo "$ECR_PASS" | sudo docker login --username AWS --password-stdin $ECR_REG
 
             # Create .env file for docker-compose
-            cat > .env <<ENVFILE
-ECR_REGISTRY=$ECR_REG
-ECR_REPOSITORY=$ECR_REPO
-IMAGE_TAG=$IMG_TAG
-ENVFILE
+            echo "ECR_REGISTRY=$ECR_REG" > .env
+            echo "ECR_REPOSITORY=$ECR_REPO" >> .env
+            echo "IMAGE_TAG=$IMG_TAG" >> .env
 
             # Deploy
             sudo docker-compose pull
