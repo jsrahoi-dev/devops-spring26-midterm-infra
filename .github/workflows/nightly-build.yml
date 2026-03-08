@@ -38,6 +38,31 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Quality Checks
+        id: quality
+        run: |
+          cd source
+
+          # Frontend linting
+          echo "🔍 Running frontend linting..."
+          cd frontend
+          npm ci
+          npm run lint
+          cd ..
+
+          # Backend linting
+          echo "🔍 Running backend linting..."
+          cd backend
+          npm ci
+          npm run lint
+
+          # Backend tests
+          echo "🧪 Running backend tests..."
+          npm test
+          cd ..
+
+          echo "✅ Quality checks passed!"
+
       - name: Build Docker image
         id: build
         env:
@@ -54,12 +79,36 @@ jobs:
           IMAGE_TAG: nightly-${{ github.run_number }}
         run: |
           cd source
+
+          # Start test database
           docker run -d --name test-db -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=color_app mysql:8
           sleep 30
-          docker run -d --name test-app --link test-db:db -e DB_HOST=db -e DB_USER=root -e DB_PASSWORD=test -e DB_NAME=color_app -e SESSION_SECRET=test -e NODE_ENV=production -p 3000:3000 $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          # Start test app
+          docker run -d --name test-app --link test-db:db \
+            -e DB_HOST=db -e DB_USER=root -e DB_PASSWORD=test \
+            -e DB_NAME=color_app -e SESSION_SECRET=test \
+            -e NODE_ENV=production -p 3000:3000 \
+            $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           sleep 15
+
+          # Test health endpoint
+          echo "Testing /api/health..."
           curl -sf http://localhost:3000/api/health || exit 1
-          echo "Smoke tests passed!"
+
+          # Test random color generation
+          echo "Testing /api/colors/next..."
+          curl -sf http://localhost:3000/api/colors/next | jq -e '.rgb_r' || exit 1
+
+          # Test global stats
+          echo "Testing /api/stats/global..."
+          curl -sf http://localhost:3000/api/stats/global | jq -e '.totalClassifications' || exit 1
+
+          # Test frontend loads
+          echo "Testing frontend..."
+          curl -sf http://localhost:3000/ | grep -q "<!DOCTYPE html>" || exit 1
+
+          echo "✅ All smoke tests passed!"
 
       - name: Push to ECR
         id: push-ecr
@@ -113,7 +162,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const failedStep = '${{ steps.build.outcome }}' === 'failure' ? 'Build' :
+            const failedStep = '${{ steps.quality.outcome }}' === 'failure' ? 'Quality Checks' :
+                               '${{ steps.build.outcome }}' === 'failure' ? 'Build' :
                                '${{ steps.smoke-test.outcome }}' === 'failure' ? 'Smoke Tests' :
                                '${{ steps.push-ecr.outcome }}' === 'failure' ? 'Push to ECR' :
                                '${{ steps.deploy.outcome }}' === 'failure' ? 'Deploy to QA' :
@@ -131,6 +181,7 @@ jobs:
             **Time:** ${new Date().toISOString()}
             
             ### Stage Outcomes:
+            - Quality Checks: ${{ steps.quality.outcome || 'skipped' }}
             - Build: ${{ steps.build.outcome || 'skipped' }}
             - Smoke Tests: ${{ steps.smoke-test.outcome || 'skipped' }}
             - Push to ECR: ${{ steps.push-ecr.outcome || 'skipped' }}
@@ -221,6 +272,7 @@ jobs:
           echo "**QA Environment:** https://qa.rahoi.dev" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "All stages completed successfully:" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Quality Checks" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Build" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Smoke Tests" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Push to ECR" >> $GITHUB_STEP_SUMMARY
