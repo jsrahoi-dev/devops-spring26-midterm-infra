@@ -1,0 +1,122 @@
+name: RC Deployment
+
+on:
+  repository_dispatch:
+    types: [rc-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'RC version tag (e.g., v1.0.0-rc1)'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: color-perception-spa
+  RC_INSTANCE_ID: i-07a954986160dee32
+
+jobs:
+  deploy-rc:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "repository_dispatch" ]; then
+            echo "VERSION=${{ github.event.client_payload.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::899088266694:role/GitHubActionsDeployRole
+          aws-region: us-east-2
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Verify image exists
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          IMAGE_TAG=${VERSION#v}
+          echo "Checking for image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          aws ecr describe-images \
+            --repository-name $ECR_REPOSITORY \
+            --image-ids imageTag=$IMAGE_TAG \
+            --region $AWS_REGION
+
+      - name: Deploy to RC EC2
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          IMAGE_TAG=${VERSION#v}
+          
+          RC_IP=$(aws ec2 describe-instances \
+            --instance-ids $RC_INSTANCE_ID \
+            --region $AWS_REGION \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          
+          echo "Deploying $VERSION to RC instance: $RC_IP"
+          echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
+          chmod 600 key.pem
+          
+          echo "#!/bin/bash" > deploy.sh
+          echo "set -e" >> deploy.sh
+          echo "aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com" >> deploy.sh
+          echo "sudo docker pull 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:$IMAGE_TAG" >> deploy.sh
+          echo "sudo docker stop color-app 2>/dev/null || true" >> deploy.sh
+          echo "sudo docker rm color-app 2>/dev/null || true" >> deploy.sh
+          echo "sudo docker run -d --name color-app -p 3000:3000 -e DB_HOST=${{ secrets.DB_HOST }} -e DB_USER=${{ secrets.DB_USER }} -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} -e DB_NAME=${{ secrets.DB_NAME }} -e SESSION_SECRET=${{ secrets.SESSION_SECRET }} -e NODE_ENV=production --restart unless-stopped 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:$IMAGE_TAG" >> deploy.sh
+          
+          scp -i key.pem -o StrictHostKeyChecking=no deploy.sh ec2-user@$RC_IP:/tmp/
+          ssh -i key.pem -o StrictHostKeyChecking=no ec2-user@$RC_IP "bash /tmp/deploy.sh"
+          rm -f key.pem
+
+      - name: Verify deployment
+        run: |
+          sleep 5
+          HEALTH=$(curl -sf https://rc.rahoi.dev/api/health || echo "failed")
+          if echo "$HEALTH" | grep -q '"status":"ok"'; then
+            echo "✅ RC deployment verified successfully"
+          else
+            echo "❌ RC deployment verification failed"
+            exit 1
+          fi
+
+      - name: Post deployment summary
+        if: success()
+        run: |
+          echo "### ✅ RC Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** RC" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://rc.rahoi.dev" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎉 Release candidate deployed successfully!" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `❌ RC Deployment Failed - ${{ steps.version.outputs.VERSION }}`,
+              body: `## RC Deployment Failure\n\n**Version:** ${{ steps.version.outputs.VERSION }}\n**Workflow:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\nRC deployment failed. Check logs for details.`,
+              labels: ['deployment-failure', 'rc', 'automated']
+            });
