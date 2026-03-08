@@ -320,14 +320,20 @@ jobs:
             IMG_TAG=$3
             ECR_PASS=$4
             cd ~/app
+
             # Login to ECR using password from GitHub Actions
             echo "$ECR_PASS" | sudo docker login --username AWS --password-stdin $ECR_REG
-            # Set environment variables and deploy
-            export ECR_REGISTRY=$ECR_REG
-            export ECR_REPOSITORY=$ECR_REPO
-            export IMAGE_TAG=$IMG_TAG
-            sudo -E docker-compose pull
-            sudo -E docker-compose up -d
+
+            # Create .env file for docker-compose
+            cat > .env <<ENVFILE
+ECR_REGISTRY=$ECR_REG
+ECR_REPOSITORY=$ECR_REPO
+IMAGE_TAG=$IMG_TAG
+ENVFILE
+
+            # Deploy
+            sudo docker-compose pull
+            sudo docker-compose up -d
             echo "⏳ Waiting for services to be healthy..."
             sleep 30
             sudo docker-compose ps
