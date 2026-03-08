@@ -1,13 +1,16 @@
 #!/bin/bash
 # smoke-test.sh - Basic health checks for deployed application
+# Usage: ./smoke-test.sh <host>
 
 set -e
 
-echo "Running smoke tests..."
+HOST=${1:-"localhost"}
+echo "Running smoke tests against: $HOST"
+echo ""
 
 # Test 1: Health endpoint
 echo "Test 1: Health endpoint..."
-HEALTH_RESPONSE=$(curl -s http://localhost:3000/api/health)
+HEALTH_RESPONSE=$(curl -sf http://$HOST/api/health || echo "failed")
 if echo "$HEALTH_RESPONSE" | grep -q '"status":"ok"'; then
   echo "✓ Health endpoint passed"
 else
@@ -18,8 +21,8 @@ fi
 
 # Test 2: Frontend loads
 echo "Test 2: Frontend HTML..."
-FRONTEND_RESPONSE=$(curl -s http://localhost:3000/)
-if echo "$FRONTEND_RESPONSE" | grep -q '<!DOCTYPE html>'; then
+FRONTEND_RESPONSE=$(curl -sf http://$HOST/ || echo "failed")
+if echo "$FRONTEND_RESPONSE" | grep -q '<!doctype html>'; then
   echo "✓ Frontend loads"
 else
   echo "✗ Frontend failed to load"
@@ -28,11 +31,12 @@ fi
 
 # Test 3: API endpoints respond
 echo "Test 3: Colors API..."
-COLORS_RESPONSE=$(curl -s http://localhost:3000/api/colors/count)
-if echo "$COLORS_RESPONSE" | grep -q '"total"'; then
+COLORS_RESPONSE=$(curl -sf http://$HOST/api/colors/next || echo "failed")
+if echo "$COLORS_RESPONSE" | grep -q '"color"'; then
   echo "✓ Colors API responds"
 else
   echo "✗ Colors API failed"
+  echo "Response: $COLORS_RESPONSE"
   exit 1
 fi
 
@@ -45,5 +49,14 @@ else
   exit 1
 fi
 
+# Test 5: Static assets
+echo "Test 5: Static assets (JS/CSS)..."
+if curl -sf http://$HOST/ | grep -q '/assets/index-'; then
+  echo "✓ Static assets referenced"
+else
+  echo "✗ Static assets not found"
+  exit 1
+fi
+
 echo ""
-echo "All smoke tests passed! ✓"
+echo "🎉 All smoke tests passed!"

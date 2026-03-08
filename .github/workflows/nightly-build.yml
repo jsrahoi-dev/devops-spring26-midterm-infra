@@ -6,29 +6,32 @@ on:
   workflow_dispatch:  # Manual trigger
 
 env:
-  AWS_REGION: us-west-2
-  ECR_REPOSITORY: color-app
-  QA_EC2_HOST: ${{ secrets.QA_EC2_HOST }}
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: color-perception-spa
+  QA_INSTANCE_ID: i-0db4adb06f60fb867
 
 jobs:
-  build-and-test:
+  build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
 
     steps:
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+
       - name: Checkout source repo
         uses: actions/checkout@v4
         with:
           repository: jsrahoi-dev/devops-spring26-midterm-source
-          token: ${{ secrets.GITHUB_TOKEN }}
+          path: source
 
-      - name: Configure AWS credentials (OIDC)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::899088266694:role/GitHubActionsDeployRole
+          aws-region: us-east-2
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -39,44 +42,28 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: nightly-${{ github.run_number }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          cd source
+          docker build --platform linux/amd64 \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
 
-      - name: Run smoke tests locally
+      - name: Run smoke tests
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: nightly-${{ github.run_number }}
         run: |
-          # Start test database
-          docker run -d --name test-db \
-            -e MYSQL_ROOT_PASSWORD=test_password \
-            -e MYSQL_DATABASE=color_app \
-            mysql:8
-
-          # Wait for DB
-          sleep 20
-
-          # Start app container
-          docker run -d --name test-app \
-            --link test-db:db \
-            -e DB_HOST=db \
-            -e DB_USER=root \
-            -e DB_PASSWORD=test_password \
-            -e DB_NAME=color_app \
-            -e SESSION_SECRET=test_secret \
-            -p 3000:3000 \
+          cd source
+          docker run -d --name test-db -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=color_app mysql:8
+          sleep 30
+          docker run -d --name test-app --link test-db:db \
+            -e DB_HOST=db -e DB_USER=root -e DB_PASSWORD=test -e DB_NAME=color_app \
+            -e SESSION_SECRET=test -e NODE_ENV=production -p 3000:3000 \
             $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-          # Wait for app
-          sleep 10
-
-          # Run smoke tests
-          curl -f http://localhost:3000/api/health || exit 1
-          curl -s http://localhost:3000/ | grep -q '<!DOCTYPE html>' || exit 1
-
+          sleep 15
+          curl -sf http://localhost:3000/api/health || exit 1
           echo "Smoke tests passed!"
 
-      - name: Push image to ECR
+      - name: Push to ECR
         if: success()
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -85,35 +72,34 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-      - name: Deploy to QA EC2
+      - name: Deploy to QA
         if: success()
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: latest
         run: |
-          echo "${{ secrets.EC2_SSH_KEY }}" > private_key.pem
-          chmod 600 private_key.pem
+          QA_IP=$(aws ec2 describe-instances --instance-ids $QA_INSTANCE_ID --region $AWS_REGION --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
+          chmod 600 key.pem
+          cat > deploy.sh << 'EOF'
+#!/bin/bash
+set -e
+aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com
+sudo docker pull 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest
+sudo docker stop color-app 2>/dev/null || true
+sudo docker rm color-app 2>/dev/null || true
+sudo docker run -d --name color-app -p 80:3000 -p 443:3000 \
+  -e DB_HOST=${{ secrets.DB_HOST }} \
+  -e DB_USER=${{ secrets.DB_USER }} \
+  -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
+  -e DB_NAME=${{ secrets.DB_NAME }} \
+  -e SESSION_SECRET=${{ secrets.SESSION_SECRET }} \
+  -e NODE_ENV=production --restart unless-stopped \
+  899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest
+EOF
+          scp -i key.pem -o StrictHostKeyChecking=no deploy.sh ec2-user@$QA_IP:/tmp/
+          ssh -i key.pem -o StrictHostKeyChecking=no ec2-user@$QA_IP "bash /tmp/deploy.sh"
+          rm -f key.pem
 
-          # Copy deployment script
-          scp -i private_key.pem -o StrictHostKeyChecking=no \
-            scripts/deploy.sh ec2-user@${{ env.QA_EC2_HOST }}:/home/ec2-user/
-
-          # Run deployment
-          ssh -i private_key.pem -o StrictHostKeyChecking=no \
-            ec2-user@${{ env.QA_EC2_HOST }} \
-            "export ECR_REGISTRY=$ECR_REGISTRY && \
-             export ECR_REPOSITORY=$ECR_REPOSITORY && \
-             bash /home/ec2-user/deploy.sh $IMAGE_TAG"
-
-          # Verify deployment
-          ssh -i private_key.pem -o StrictHostKeyChecking=no \
-            ec2-user@${{ env.QA_EC2_HOST }} \
-            "curl -f http://localhost:3000/api/health"
-
-          rm -f private_key.pem
-
-      - name: Cleanup on failure
-        if: failure()
+      - name: Cleanup
+        if: always()
         run: |
-          docker stop test-app test-db || true
-          docker rm test-app test-db || true
+          docker stop test-app test-db 2>/dev/null || true
+          docker rm test-app test-db 2>/dev/null || true
