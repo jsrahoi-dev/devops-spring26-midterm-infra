@@ -330,11 +330,11 @@ jobs:
             echo "IMAGE_TAG=$IMG_TAG" >> .env
 
             # Deploy
-            sudo docker-compose pull
-            sudo docker-compose up -d
+            sudo docker-compose --env-file .env pull
+            sudo docker-compose --env-file .env up -d
             echo "⏳ Waiting for services to be healthy..."
             sleep 30
-            sudo docker-compose ps
+            sudo docker-compose --env-file .env ps
           ENDSSH
 
 
