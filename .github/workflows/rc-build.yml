@@ -111,41 +111,20 @@ jobs:
         if: success()
         env:
           IMAGE_TAG: ${{ steps.version.outputs.IMAGE_TAG }}
-          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
         run: |
           RC_IP=$(aws ec2 describe-instances --instance-ids "$RC_INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-          echo "$SSH_KEY" > key.pem
+          echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
           chmod 600 key.pem
-          cat > deploy.sh << 'DEPLOY_SCRIPT'
-#!/bin/bash
-set -e
-aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com
-sudo docker pull "899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:${IMAGE_TAG}"
-sudo docker stop color-app 2>/dev/null || true
-sudo docker rm color-app 2>/dev/null || true
-sudo docker run -d --name color-app -p 3000:3000 \
-  -e "DB_HOST=${DB_HOST}" \
-  -e "DB_USER=${DB_USER}" \
-  -e "DB_PASSWORD=${DB_PASSWORD}" \
-  -e "DB_NAME=color_app_rc" \
-  -e "SESSION_SECRET=${SESSION_SECRET}" \
-  -e "NODE_ENV=production" \
-  --restart unless-stopped \
-  "899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:${IMAGE_TAG}"
-DEPLOY_SCRIPT
-          # Replace placeholders with actual values
-          sed -i.bak "s/\${IMAGE_TAG}/$IMAGE_TAG/g" deploy.sh
-          sed -i.bak "s/\${DB_HOST}/$DB_HOST/g" deploy.sh
-          sed -i.bak "s/\${DB_USER}/$DB_USER/g" deploy.sh
-          sed -i.bak "s/\${DB_PASSWORD}/$DB_PASSWORD/g" deploy.sh
-          sed -i.bak "s/\${SESSION_SECRET}/$SESSION_SECRET/g" deploy.sh
-          scp -i key.pem -o StrictHostKeyChecking=no deploy.sh "ec2-user@$RC_IP:/tmp/"
-          ssh -i key.pem -o StrictHostKeyChecking=no "ec2-user@$RC_IP" "bash /tmp/deploy.sh"
-          rm -f key.pem deploy.sh deploy.sh.bak
+          echo "#!/bin/bash" > deploy.sh
+          echo "set -e" >> deploy.sh
+          echo "aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com" >> deploy.sh
+          echo "sudo docker pull 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:$IMAGE_TAG" >> deploy.sh
+          echo "sudo docker stop color-app 2>/dev/null || true" >> deploy.sh
+          echo "sudo docker rm color-app 2>/dev/null || true" >> deploy.sh
+          echo "sudo docker run -d --name color-app -p 3000:3000 -e DB_HOST=${{ secrets.DB_HOST }} -e DB_USER=${{ secrets.DB_USER }} -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} -e DB_NAME=color_app_rc -e SESSION_SECRET=${{ secrets.SESSION_SECRET }} -e NODE_ENV=production --restart unless-stopped 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:$IMAGE_TAG" >> deploy.sh
+          scp -i key.pem -o StrictHostKeyChecking=no deploy.sh ec2-user@$RC_IP:/tmp/
+          ssh -i key.pem -o StrictHostKeyChecking=no ec2-user@$RC_IP "bash /tmp/deploy.sh"
+          rm -f key.pem
 
       - name: Verify deployment
         id: verify
