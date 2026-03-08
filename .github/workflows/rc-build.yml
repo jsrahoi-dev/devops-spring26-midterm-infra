@@ -290,6 +290,18 @@ jobs:
                 db:
                   condition: service_healthy
           EOF
+          # Wait for Docker to be installed (user-data script)
+          echo "⏳ Waiting for Docker installation to complete..."
+          for i in {1..30}; do
+            if ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP "command -v docker && command -v docker-compose" 2>/dev/null; then
+              echo "✅ Docker and docker-compose are ready"
+              break
+            fi
+            echo "Still waiting for Docker... ($i/30)"
+            sleep 10
+          done
+
+
 
           # Create app directory on EC2
           ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP "mkdir -p ~/app"
@@ -298,14 +310,18 @@ jobs:
           scp -i test-key.pem -o StrictHostKeyChecking=no docker-compose.test.yml ec2-user@$PUBLIC_IP:~/app/docker-compose.yml
 
           
+          # Get ECR login password (GitHub Actions has AWS creds)
+          ECR_PASSWORD=$(aws ecr get-login-password --region us-east-2)
+          
           # Deploy on EC2
-          ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP bash -s << ENDSSH ${{ steps.login-ecr.outputs.registry }} $ECR_REPOSITORY ${{ steps.version.outputs.IMAGE_TAG }}
+          ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP bash -s << ENDSSH "${{ steps.login-ecr.outputs.registry }}" "$ECR_REPOSITORY" "${{ steps.version.outputs.IMAGE_TAG }}" "$ECR_PASSWORD"
             ECR_REG=$1
             ECR_REPO=$2
             IMG_TAG=$3
+            ECR_PASS=$4
             cd ~/app
-            # Login to ECR
-            aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin $ECR_REG
+            # Login to ECR using password from GitHub Actions
+            echo "$ECR_PASS" | sudo docker login --username AWS --password-stdin $ECR_REG
             # Set environment variables and deploy
             export ECR_REGISTRY=$ECR_REG
             export ECR_REPOSITORY=$ECR_REPO
@@ -316,6 +332,7 @@ jobs:
             sleep 30
             sudo docker-compose ps
           ENDSSH
+
 
           echo "✅ Application deployed to temp EC2"
 
