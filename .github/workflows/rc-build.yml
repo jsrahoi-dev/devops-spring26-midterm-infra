@@ -315,26 +315,26 @@ jobs:
           
           # Deploy on EC2
           ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP bash -s << ENDSSH "${{ steps.login-ecr.outputs.registry }}" "$ECR_REPOSITORY" "${{ steps.version.outputs.IMAGE_TAG }}" "$ECR_PASSWORD"
-            ECR_REG=$1
-            ECR_REPO=$2
-            IMG_TAG=$3
-            ECR_PASS=$4
+            ECR_REG=\$1
+            ECR_REPO=\$2
+            IMG_TAG=\$3
+            ECR_PASS=\$4
             cd ~/app
 
             # Login to ECR using password from GitHub Actions
-            echo "$ECR_PASS" | sudo docker login --username AWS --password-stdin $ECR_REG
+            echo "\$ECR_PASS" | sudo docker login --username AWS --password-stdin \$ECR_REG
 
-            # Create .env file for docker-compose
-            echo "ECR_REGISTRY=$ECR_REG" > .env
-            echo "ECR_REPOSITORY=$ECR_REPO" >> .env
-            echo "IMAGE_TAG=$IMG_TAG" >> .env
+            # Substitute values directly into docker-compose.yml
+            sed -i "s|\\\${ECR_REGISTRY}|\$ECR_REG|g" docker-compose.yml
+            sed -i "s|\\\${ECR_REPOSITORY}|\$ECR_REPO|g" docker-compose.yml
+            sed -i "s|\\\${IMAGE_TAG}|\$IMG_TAG|g" docker-compose.yml
 
             # Deploy
-            sudo docker-compose --env-file .env pull
-            sudo docker-compose --env-file .env up -d
+            sudo docker-compose pull
+            sudo docker-compose up -d
             echo "⏳ Waiting for services to be healthy..."
             sleep 30
-            sudo docker-compose --env-file .env ps
+            sudo docker-compose ps
           ENDSSH
 
 
