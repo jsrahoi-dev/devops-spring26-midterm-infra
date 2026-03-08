@@ -127,22 +127,27 @@ jobs:
 
           # Test health endpoint
           echo "Testing /api/health..."
-          curl -sf http://localhost:3000/api/health || exit 1
+          HEALTH=$(curl -s http://localhost:3000/api/health)
+          echo "Response: $HEALTH"
+          echo "$HEALTH" | jq -e '.status == "ok"' || exit 1
 
           # Test random color generation
           echo "Testing /api/colors/next..."
-          curl -sf http://localhost:3000/api/colors/next | jq -e '.rgb_r' || exit 1
+          COLORS=$(curl -s http://localhost:3000/api/colors/next)
+          echo "Response: $COLORS"
+          echo "$COLORS" | jq -e '.rgb_r' || { echo "ERROR: Failed colors test"; docker logs test-app; exit 1; }
 
           # Test global stats
           echo "Testing /api/stats/global..."
-          curl -sf http://localhost:3000/api/stats/global | jq -e '.totalClassifications' || exit 1
+          STATS=$(curl -s http://localhost:3000/api/stats/global)
+          echo "Response: $STATS"
+          echo "$STATS" | jq -e '.totalClassifications' || { echo "ERROR: Failed stats test"; docker logs test-app; exit 1; }
 
           # Test frontend loads
           echo "Testing frontend..."
           curl -sf http://localhost:3000/ | grep -q "<!DOCTYPE html>" || exit 1
 
           echo "✅ All smoke tests passed!"
-
       - name: Push to ECR
         id: push-ecr
         if: success()
