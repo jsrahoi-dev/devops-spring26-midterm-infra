@@ -1,0 +1,253 @@
+name: RC Build and Deploy
+
+on:
+  repository_dispatch:
+    types: [rc-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'RC version tag (e.g., v1.1.1-rc1)'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: color-perception-spa
+  RC_INSTANCE_ID: i-07a954986160dee32
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout infra repo
+        id: checkout-infra
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        env:
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          INPUT_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" == "repository_dispatch" ]; then
+            VERSION="$DISPATCH_VERSION"
+          else
+            VERSION="$INPUT_VERSION"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${VERSION#v}" >> $GITHUB_OUTPUT
+          echo "📦 Building RC version: $VERSION"
+
+      - name: Checkout source repo at RC tag
+        id: checkout-source
+        uses: actions/checkout@v4
+        with:
+          repository: jsrahoi-dev/devops-spring26-midterm-source
+          ref: ${{ steps.version.outputs.VERSION }}
+          path: source
+
+      - name: Configure AWS credentials
+        id: aws-credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::899088266694:role/GitHubActionsDeployRole
+          aws-region: us-east-2
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          IMAGE_TAG: ${{ steps.version.outputs.IMAGE_TAG }}
+          BUILD_DATE: ${{ github.run_id }}
+        run: |
+          cd source
+          echo "Building image with tag: $IMAGE_TAG"
+          docker build --platform linux/amd64 \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:rc" \
+            --label "version=$VERSION" \
+            --label "git.commit=$GITHUB_SHA" \
+            --label "build.date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            .
+
+      - name: Run smoke tests
+        id: smoke-test
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.version.outputs.IMAGE_TAG }}
+        run: |
+          cd source
+          docker run -d --name test-db -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=color_app mysql:8
+          sleep 30
+          docker run -d --name test-app --link test-db:db -e DB_HOST=db -e DB_USER=root -e DB_PASSWORD=test -e DB_NAME=color_app -e SESSION_SECRET=test -e NODE_ENV=production -p 3000:3000 "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          sleep 15
+          curl -sf http://localhost:3000/api/health || exit 1
+          echo "✅ Smoke tests passed!"
+
+      - name: Push to ECR
+        id: push-ecr
+        if: success()
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.version.outputs.IMAGE_TAG }}
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:rc"
+          echo "✅ Pushed images: $IMAGE_TAG, rc"
+
+      - name: Deploy to RC
+        id: deploy
+        if: success()
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.IMAGE_TAG }}
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+        run: |
+          RC_IP=$(aws ec2 describe-instances --instance-ids "$RC_INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "$SSH_KEY" > key.pem
+          chmod 600 key.pem
+          cat > deploy.sh << 'DEPLOY_SCRIPT'
+#!/bin/bash
+set -e
+aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com
+sudo docker pull "899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:${IMAGE_TAG}"
+sudo docker stop color-app 2>/dev/null || true
+sudo docker rm color-app 2>/dev/null || true
+sudo docker run -d --name color-app -p 3000:3000 \
+  -e "DB_HOST=${DB_HOST}" \
+  -e "DB_USER=${DB_USER}" \
+  -e "DB_PASSWORD=${DB_PASSWORD}" \
+  -e "DB_NAME=color_app_rc" \
+  -e "SESSION_SECRET=${SESSION_SECRET}" \
+  -e "NODE_ENV=production" \
+  --restart unless-stopped \
+  "899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:${IMAGE_TAG}"
+DEPLOY_SCRIPT
+          # Replace placeholders with actual values
+          sed -i.bak "s/\${IMAGE_TAG}/$IMAGE_TAG/g" deploy.sh
+          sed -i.bak "s/\${DB_HOST}/$DB_HOST/g" deploy.sh
+          sed -i.bak "s/\${DB_USER}/$DB_USER/g" deploy.sh
+          sed -i.bak "s/\${DB_PASSWORD}/$DB_PASSWORD/g" deploy.sh
+          sed -i.bak "s/\${SESSION_SECRET}/$SESSION_SECRET/g" deploy.sh
+          scp -i key.pem -o StrictHostKeyChecking=no deploy.sh "ec2-user@$RC_IP:/tmp/"
+          ssh -i key.pem -o StrictHostKeyChecking=no "ec2-user@$RC_IP" "bash /tmp/deploy.sh"
+          rm -f key.pem deploy.sh deploy.sh.bak
+
+      - name: Verify deployment
+        id: verify
+        if: success()
+        run: |
+          sleep 5
+          HEALTH=$(curl -sf https://rc.rahoi.dev/api/health || echo "failed")
+          if echo "$HEALTH" | grep -q '"status":"ok"'; then
+            echo "✅ RC deployment verified successfully"
+          else
+            echo "❌ RC deployment verification failed"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop test-app test-db 2>/dev/null || true
+          docker rm test-app test-db 2>/dev/null || true
+
+      - name: Create success summary
+        if: success()
+        run: |
+          echo "### ✅ RC Build and Deploy Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** ${{ steps.version.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow Run:** #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Quick Links:" >> $GITHUB_STEP_SUMMARY
+          echo "- [RC Environment](https://rc.rahoi.dev)" >> $GITHUB_STEP_SUMMARY
+          echo "- [View Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎉 Release candidate deployed successfully!" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create failure summary
+        if: failure()
+        run: |
+          echo "### ❌ RC Build Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow Run:** #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Stage Outcomes:" >> $GITHUB_STEP_SUMMARY
+          echo "- Checkout Infra: ${{ steps.checkout-infra.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Checkout Source: ${{ steps.checkout-source.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- AWS Credentials: ${{ steps.aws-credentials.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build: ${{ steps.build.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Smoke Tests: ${{ steps.smoke-test.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Push to ECR: ${{ steps.push-ecr.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deploy to RC: ${{ steps.deploy.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Verify: ${{ steps.verify.outcome }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const failedStage =
+              '${{ steps.checkout-infra.outcome }}' === 'failure' ? 'Checkout Infra' :
+              '${{ steps.checkout-source.outcome }}' === 'failure' ? 'Checkout Source' :
+              '${{ steps.aws-credentials.outcome }}' === 'failure' ? 'AWS Credentials' :
+              '${{ steps.build.outcome }}' === 'failure' ? 'Docker Build' :
+              '${{ steps.smoke-test.outcome }}' === 'failure' ? 'Smoke Tests' :
+              '${{ steps.push-ecr.outcome }}' === 'failure' ? 'Push to ECR' :
+              '${{ steps.deploy.outcome }}' === 'failure' ? 'Deploy to RC' :
+              '${{ steps.verify.outcome }}' === 'failure' ? 'Verify Deployment' :
+              'Unknown';
+
+            const title = `❌ RC Build Failed - ${failedStage} - ${{ steps.version.outputs.VERSION }}`;
+
+            const body = `## RC Build Failure Report
+
+**Failed Stage:** ${failedStage}
+**Version:** ${{ steps.version.outputs.VERSION }}
+**Workflow Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+**Triggered by:** ${{ github.event_name }}
+
+### Stage Outcomes:
+- Checkout Infra: ${{ steps.checkout-infra.outcome }}
+- Checkout Source: ${{ steps.checkout-source.outcome }}
+- AWS Credentials: ${{ steps.aws-credentials.outcome }}
+- Build: ${{ steps.build.outcome }}
+- Smoke Tests: ${{ steps.smoke-test.outcome }}
+- Push to ECR: ${{ steps.push-ecr.outcome }}
+- Deploy to RC: ${{ steps.deploy.outcome }}
+- Verify: ${{ steps.verify.outcome }}
+
+### Quick Links:
+- [View Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+- [RC Environment](https://rc.rahoi.dev)
+
+### Recommended Actions:
+1. Check the workflow logs for detailed error messages
+2. Verify AWS credentials and permissions
+3. Ensure the source tag exists
+4. Check EC2 instance health`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['rc-build-failure', 'automated']
+            });
