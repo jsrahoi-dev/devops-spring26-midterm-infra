@@ -2,8 +2,8 @@ name: Nightly Build and Deploy to QA
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # 2 AM daily
-  workflow_dispatch:  # Manual trigger
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 env:
   AWS_REGION: us-east-2
@@ -43,9 +43,7 @@ jobs:
           IMAGE_TAG: nightly-${{ github.run_number }}
         run: |
           cd source
-          docker build --platform linux/amd64 \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker build --platform linux/amd64 -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
 
       - name: Run smoke tests
         env:
@@ -55,10 +53,7 @@ jobs:
           cd source
           docker run -d --name test-db -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=color_app mysql:8
           sleep 30
-          docker run -d --name test-app --link test-db:db \
-            -e DB_HOST=db -e DB_USER=root -e DB_PASSWORD=test -e DB_NAME=color_app \
-            -e SESSION_SECRET=test -e NODE_ENV=production -p 3000:3000 \
-            $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker run -d --name test-app --link test-db:db -e DB_HOST=db -e DB_USER=root -e DB_PASSWORD=test -e DB_NAME=color_app -e SESSION_SECRET=test -e NODE_ENV=production -p 3000:3000 $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           sleep 15
           curl -sf http://localhost:3000/api/health || exit 1
           echo "Smoke tests passed!"
@@ -78,22 +73,13 @@ jobs:
           QA_IP=$(aws ec2 describe-instances --instance-ids $QA_INSTANCE_ID --region $AWS_REGION --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
           echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
           chmod 600 key.pem
-          cat > deploy.sh << 'EOF'
-#!/bin/bash
-set -e
-aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com
-sudo docker pull 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest
-sudo docker stop color-app 2>/dev/null || true
-sudo docker rm color-app 2>/dev/null || true
-sudo docker run -d --name color-app -p 80:3000 -p 443:3000 \
-  -e DB_HOST=${{ secrets.DB_HOST }} \
-  -e DB_USER=${{ secrets.DB_USER }} \
-  -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
-  -e DB_NAME=${{ secrets.DB_NAME }} \
-  -e SESSION_SECRET=${{ secrets.SESSION_SECRET }} \
-  -e NODE_ENV=production --restart unless-stopped \
-  899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest
-EOF
+          echo "#!/bin/bash" > deploy.sh
+          echo "set -e" >> deploy.sh
+          echo "aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com" >> deploy.sh
+          echo "sudo docker pull 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest" >> deploy.sh
+          echo "sudo docker stop color-app 2>/dev/null || true" >> deploy.sh
+          echo "sudo docker rm color-app 2>/dev/null || true" >> deploy.sh
+          echo "sudo docker run -d --name color-app -p 80:3000 -p 443:3000 -e DB_HOST=${{ secrets.DB_HOST }} -e DB_USER=${{ secrets.DB_USER }} -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} -e DB_NAME=${{ secrets.DB_NAME }} -e SESSION_SECRET=${{ secrets.SESSION_SECRET }} -e NODE_ENV=production --restart unless-stopped 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest" >> deploy.sh
           scp -i key.pem -o StrictHostKeyChecking=no deploy.sh ec2-user@$QA_IP:/tmp/
           ssh -i key.pem -o StrictHostKeyChecking=no ec2-user@$QA_IP "bash /tmp/deploy.sh"
           rm -f key.pem
