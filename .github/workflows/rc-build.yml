@@ -63,6 +63,27 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Quality Checks
+        id: quality
+        run: |
+          cd source
+
+          # Frontend linting
+          echo "Running frontend linting..."
+          cd frontend
+          npm ci
+          npm run lint
+          cd ..
+
+          # Backend linting
+          echo "Running backend linting..."
+          cd backend
+          npm ci
+          npm run lint
+          cd ..
+
+          echo "Quality checks passed!"
+
       - name: Build Docker image
         id: build
         env:
