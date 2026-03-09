@@ -142,10 +142,12 @@ jobs:
           STATS=$(curl -s http://localhost:3000/api/stats/global)
           echo "Response: $STATS"
           echo "$STATS" | jq -e '.totalClassifications' || { echo "ERROR: Failed stats test"; docker logs test-app; exit 1; }
-
           # Test frontend loads
           echo "Testing frontend..."
-          curl -sf http://localhost:3000/ | grep -q "<!DOCTYPE html>" || exit 1
+          FRONTEND=$(curl -s http://localhost:3000/)
+          echo "Response (first 500 chars): ${FRONTEND:0:500}"
+          echo "$FRONTEND" | grep -q "<!DOCTYPE html>" || { echo "ERROR: Frontend test failed - no DOCTYPE found"; exit 1; }
+
 
           echo "✅ All smoke tests passed!"
       - name: Push to ECR
