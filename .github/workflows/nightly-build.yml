@@ -129,7 +129,7 @@ jobs:
           echo "set -e" >> deploy.sh
           echo "aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com" >> deploy.sh
           echo "# Install MySQL client if not present" >> deploy.sh
-          echo "command -v mysql >/dev/null 2>&1 || sudo yum install -y mariadb" >> deploy.sh
+          echo "command -v mysql >/dev/null 2>&1 || sudo yum install -y mysql" >> deploy.sh
 
           echo "# Create QA database if it does not exist" >> deploy.sh
           echo "mysql -h ${{ secrets.DB_HOST }} -u ${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} -e \"CREATE DATABASE IF NOT EXISTS color_app_qa;\"" >> deploy.sh
