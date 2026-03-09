@@ -128,11 +128,6 @@ jobs:
           echo "#!/bin/bash" > deploy.sh
           echo "set -e" >> deploy.sh
           echo "aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com" >> deploy.sh
-          echo "# Create QA database if it does not exist" >> deploy.sh
-          echo "sudo docker run --rm mysql:8 mysql -h ${{ secrets.DB_HOST }} -u ${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} -e \"CREATE DATABASE IF NOT EXISTS color_app_qa;\"" >> deploy.sh
-          echo "# Create responses table" >> deploy.sh
-          echo "sudo docker run --rm mysql:8 mysql -h ${{ secrets.DB_HOST }} -u ${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} color_app_qa -e \"CREATE TABLE IF NOT EXISTS responses (id INT PRIMARY KEY AUTO_INCREMENT, session_id VARCHAR(128) NOT NULL, rgb_r TINYINT UNSIGNED NOT NULL, rgb_g TINYINT UNSIGNED NOT NULL, rgb_b TINYINT UNSIGNED NOT NULL, hex VARCHAR(7) NOT NULL, user_classification ENUM('pink', 'red', 'orange', 'yellow', 'green', 'blue', 'purple', 'brown', 'black', 'white', 'grey') NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, classified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX idx_session (session_id), INDEX idx_rgb (rgb_r, rgb_g, rgb_b)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\"" >> deploy.sh
-
           echo "" >> deploy.sh
 
 
@@ -141,7 +136,13 @@ jobs:
           echo "sudo docker stop color-app 2>/dev/null || true" >> deploy.sh
           echo "sudo docker rm color-app 2>/dev/null || true" >> deploy.sh
           echo "sudo docker run -d --name color-app -p 3000:3000 -e DB_HOST=${{ secrets.DB_HOST }} -e DB_USER=${{ secrets.DB_USER }} -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} -e DB_NAME=color_app_qa -e SESSION_SECRET=${{ secrets.SESSION_SECRET }} -e NODE_ENV=production --restart unless-stopped 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest" >> deploy.sh
+          echo "echo Waiting for application to start..." >> deploy.sh
+          echo "sleep 10" >> deploy.sh
+          echo "echo Application logs:" >> deploy.sh
+          echo "sudo docker logs color-app" >> deploy.sh
+
           scp -i key.pem -o StrictHostKeyChecking=no deploy.sh ec2-user@$QA_IP:/tmp/
+
           ssh -i key.pem -o StrictHostKeyChecking=no ec2-user@$QA_IP "bash /tmp/deploy.sh"
           rm -f key.pem
 
