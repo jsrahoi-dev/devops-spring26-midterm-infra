@@ -1,0 +1,22 @@
+          # Get ECR login password (GitHub Actions has AWS creds)
+          ECR_PASSWORD=$(aws ecr get-login-password --region us-east-2)
+          
+          # Deploy on EC2
+          ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP bash -s << ENDSSH "${{ steps.login-ecr.outputs.registry }}" "$ECR_REPOSITORY" "${{ steps.version.outputs.IMAGE_TAG }}" "$ECR_PASSWORD"
+            ECR_REG=\$1
+            ECR_REPO=\$2
+            IMG_TAG=\$3
+            ECR_PASS=\$4
+            cd ~/app
+            # Login to ECR using password from GitHub Actions
+            echo "\$ECR_PASS" | sudo docker login --username AWS --password-stdin \$ECR_REG
+            # Set environment variables and deploy
+            export ECR_REGISTRY=\$ECR_REG
+            export ECR_REPOSITORY=\$ECR_REPO
+            export IMAGE_TAG=\$IMG_TAG
+            sudo -E docker-compose pull
+            sudo -E docker-compose up -d
+            echo "⏳ Waiting for services to be healthy..."
+            sleep 30
+            sudo docker-compose ps
+          ENDSSH

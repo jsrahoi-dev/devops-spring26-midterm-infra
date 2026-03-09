@@ -1,0 +1,493 @@
+name: RC Build and Deploy
+
+on:
+  repository_dispatch:
+    types: [rc-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'RC version tag (e.g., v1.1.1-rc1)'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: color-perception-spa
+  RC_INSTANCE_ID: i-07a954986160dee32
+  EC2_INSTANCE_TYPE: t3.micro
+  TEST_STACK_NAME: rc-integration-test-${{ github.run_id }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout infra repo
+        id: checkout-infra
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        env:
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          INPUT_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" == "repository_dispatch" ]; then
+            VERSION="$DISPATCH_VERSION"
+          else
+            VERSION="$INPUT_VERSION"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${VERSION#v}" >> $GITHUB_OUTPUT
+          echo "📦 Building RC version: $VERSION"
+
+      - name: Checkout source repo at RC tag
+        id: checkout-source
+        uses: actions/checkout@v4
+        with:
+          repository: jsrahoi-dev/devops-spring26-midterm-source
+          ref: ${{ steps.version.outputs.VERSION }}
+          path: source
+
+      - name: Configure AWS credentials
+        id: aws-credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::899088266694:role/GitHubActionsDeployRole
+          aws-region: us-east-2
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Quality Checks
+        id: quality
+        run: |
+          cd source
+
+          # Frontend linting
+          echo "🔍 Running frontend linting..."
+          cd frontend
+          npm ci
+          npm run lint
+          cd ..
+
+          # Backend linting
+          echo "🔍 Running backend linting..."
+          cd backend
+          npm ci
+          npm run lint
+
+          # Backend tests
+          echo "🧪 Running backend tests..."
+          npm test
+          cd ..
+
+          echo "✅ Quality checks passed!"
+
+      - name: Build Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          IMAGE_TAG: ${{ steps.version.outputs.IMAGE_TAG }}
+          BUILD_DATE: ${{ github.run_id }}
+        run: |
+          cd source
+          echo "Building image with tag: $IMAGE_TAG"
+          docker build --platform linux/amd64 \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:rc" \
+            --label "version=$VERSION" \
+            --label "git.commit=$GITHUB_SHA" \
+            --label "build.date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            .
+
+      - name: Run smoke tests
+        id: smoke-test
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.version.outputs.IMAGE_TAG }}
+        run: |
+          cd source
+
+          # Start test database
+          docker run -d --name test-db -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=color_app mysql:8
+          sleep 30
+
+          # Start test app
+          docker run -d --name test-app --link test-db:db \
+            -e DB_HOST=db -e DB_USER=root -e DB_PASSWORD=test \
+            -e DB_NAME=color_app -e SESSION_SECRET=test \
+            -e NODE_ENV=production -p 3000:3000 \
+            "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          sleep 15
+
+          # Test health endpoint
+          echo "Testing /api/health..."
+          curl -sf http://localhost:3000/api/health || exit 1
+
+          # Test random color generation
+          echo "Testing /api/colors/next..."
+          curl -sf http://localhost:3000/api/colors/next | jq -e '.rgb_r' || exit 1
+
+          # Test global stats
+          echo "Testing /api/stats/global..."
+          curl -sf http://localhost:3000/api/stats/global | jq -e '.totalClassifications' || exit 1
+
+          # Test frontend loads
+          echo "Testing frontend..."
+          curl -sf http://localhost:3000/ | grep -q "<!DOCTYPE html>" || exit 1
+
+          echo "✅ All smoke tests passed!"
+
+      - name: Push to ECR
+        id: push-ecr
+        if: success()
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.version.outputs.IMAGE_TAG }}
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:rc"
+          echo "✅ Pushed images: $IMAGE_TAG, rc"
+
+      - name: Create temporary security group
+        id: security-group
+        if: success()
+        run: |
+          # Get default VPC
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query 'Vpcs[0].VpcId' --output text)
+
+          # Create security group for test instance
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "$TEST_STACK_NAME" \
+            --description "Temporary security group for RC integration tests" \
+            --vpc-id "$VPC_ID" \
+            --query 'GroupId' \
+            --output text)
+
+          # Allow SSH from GitHub Actions
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr 0.0.0.0/0
+
+          # Allow HTTP for testing
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp \
+            --port 80 \
+            --cidr 0.0.0.0/0
+
+          echo "SG_ID=$SG_ID" >> $GITHUB_OUTPUT
+          echo "✅ Created security group: $SG_ID"
+
+      - name: Launch temporary EC2 instance
+        id: ec2
+        if: success()
+        run: |
+          # Get latest Amazon Linux 2023 AMI
+          AMI_ID=$(aws ec2 describe-images \
+            --owners amazon \
+            --filters "Name=name,Values=al2023-ami-2023*-x86_64" \
+            --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+            --output text)
+
+          # Create SSH key pair
+          KEY_NAME="$TEST_STACK_NAME-key"
+          aws ec2 create-key-pair \
+            --key-name "$KEY_NAME" \
+            --query 'KeyMaterial' \
+            --output text > test-key.pem
+          chmod 600 test-key.pem
+
+          # Launch instance with user data to install Docker
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "$AMI_ID" \
+            --instance-type "$EC2_INSTANCE_TYPE" \
+            --key-name "$KEY_NAME" \
+            --security-group-ids "${{ steps.security-group.outputs.SG_ID }}" \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$TEST_STACK_NAME},{Key=Purpose,Value=RCIntegrationTest},{Key=GithubRunId,Value=${{ github.run_id }}}]" \
+            --user-data '#!/bin/bash
+              yum update -y
+              yum install -y docker
+              systemctl start docker
+              systemctl enable docker
+              usermod -a -G docker ec2-user
+              curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+            ' \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "KEY_NAME=$KEY_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Launched instance: $INSTANCE_ID"
+
+          # Wait for instance to be running
+          echo "⏳ Waiting for instance to be running..."
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+
+          # Get public IP
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "✅ Instance running at: $PUBLIC_IP"
+
+          # Wait for SSH to be available
+          echo "⏳ Waiting for SSH to be available..."
+          for i in {1..30}; do
+            if ssh -i test-key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=5 ec2-user@$PUBLIC_IP "echo connected" 2>/dev/null; then
+              echo "✅ SSH is available"
+              break
+            fi
+            sleep 10
+          done
+
+      - name: Deploy application stack to temp EC2
+        id: deploy-temp
+        if: success()
+        env:
+          PUBLIC_IP: ${{ steps.ec2.outputs.PUBLIC_IP }}
+        run: |
+          # Create docker-compose file
+          cat > docker-compose.test.yml <<'EOF'
+          version: '3.8'
+          services:
+            db:
+              image: mysql:8
+              environment:
+                MYSQL_ROOT_PASSWORD: test_password
+                MYSQL_DATABASE: color_app_test
+              healthcheck:
+                test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            app:
+              image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+              ports:
+                - "80:3000"
+              environment:
+                DB_HOST: db
+                DB_USER: root
+                DB_PASSWORD: test_password
+                DB_NAME: color_app_test
+                SESSION_SECRET: test_secret
+                NODE_ENV: production
+              depends_on:
+                db:
+                  condition: service_healthy
+          EOF
+
+          # Copy files to EC2
+          scp -i test-key.pem -o StrictHostKeyChecking=no -r source/* ec2-user@$PUBLIC_IP:~/app/
+          scp -i test-key.pem -o StrictHostKeyChecking=no docker-compose.test.yml ec2-user@$PUBLIC_IP:~/app/docker-compose.yml
+
+          # Deploy on EC2
+          ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP <<'ENDSSH'
+            cd ~/app
+            sudo docker-compose up -d --build
+            echo "⏳ Waiting for services to be healthy..."
+            sleep 30
+            sudo docker-compose ps
+          ENDSSH
+
+          echo "✅ Application deployed to temp EC2"
+
+      - name: Run integration tests
+        id: integration-tests
+        if: success()
+        env:
+          PUBLIC_IP: ${{ steps.ec2.outputs.PUBLIC_IP }}
+          TEST_URL: http://${{ steps.ec2.outputs.PUBLIC_IP }}
+        run: |
+          cd source/backend
+
+          # Run tests against deployed instance
+          API_URL="$TEST_URL" npm test
+
+          echo "✅ Integration tests passed"
+
+      - name: Run comprehensive API tests
+        id: comprehensive-tests
+        if: success()
+        env:
+          TEST_URL: http://${{ steps.ec2.outputs.PUBLIC_IP }}
+        run: |
+          echo "🧪 Running comprehensive API tests..."
+
+          # Test health endpoint
+          echo "Testing /api/health..."
+          curl -sf "$TEST_URL/api/health" | jq -e '.status == "ok"' || exit 1
+
+          # Test random color generation
+          echo "Testing /api/colors/next..."
+          COLOR=$(curl -sf "$TEST_URL/api/colors/next")
+          echo "$COLOR" | jq -e '.rgb_r >= 0 and .rgb_r <= 255' || exit 1
+          echo "$COLOR" | jq -e '.rgb_g >= 0 and .rgb_g <= 255' || exit 1
+          echo "$COLOR" | jq -e '.rgb_b >= 0 and .rgb_b <= 255' || exit 1
+          echo "$COLOR" | jq -e '.hex | test("^#[0-9A-F]{6}$")' || exit 1
+
+          # Test classification submission (needs session)
+          echo "Testing /api/responses..."
+          SESSION_COOKIE=$(curl -sI "$TEST_URL/api/colors/next" | grep -i "set-cookie" | head -1 | cut -d' ' -f2)
+          RESPONSE=$(curl -sf -X POST "$TEST_URL/api/responses" \
+            -H "Content-Type: application/json" \
+            -H "Cookie: $SESSION_COOKIE" \
+            -d '{"rgb_r":255,"rgb_g":0,"rgb_b":0,"hex":"#FF0000","classification":"red"}')
+          echo "$RESPONSE" | jq -e '.success == true' || exit 1
+
+          # Test personal stats
+          echo "Testing /api/stats/personal..."
+          curl -sf "$TEST_URL/api/stats/personal" -H "Cookie: $SESSION_COOKIE" | jq -e '.totalClassified >= 0' || exit 1
+
+          # Test global stats
+          echo "Testing /api/stats/global..."
+          STATS=$(curl -sf "$TEST_URL/api/stats/global")
+          echo "$STATS" | jq -e '.totalClassifications >= 0' || exit 1
+          echo "$STATS" | jq -e '.uniqueUsers >= 0' || exit 1
+          echo "$STATS" | jq -e '.totalColorsClassified >= 0' || exit 1
+
+          # Test visualization endpoint
+          echo "Testing /api/visualize/data..."
+          curl -sf "$TEST_URL/api/visualize/data?view=global" | jq -e '.view == "global"' || exit 1
+          curl -sf "$TEST_URL/api/visualize/data?view=personal" | jq -e '.view == "personal"' || exit 1
+
+          # Test frontend
+          echo "Testing frontend..."
+          curl -sf "$TEST_URL/" | grep -q "<!DOCTYPE html>" || exit 1
+
+          echo "✅ All comprehensive API tests passed!"
+
+      - name: Collect integration test logs
+        if: always()
+        env:
+          PUBLIC_IP: ${{ steps.ec2.outputs.PUBLIC_IP }}
+        run: |
+          if [ -n "$PUBLIC_IP" ]; then
+            ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP \
+              "cd ~/app && sudo docker-compose logs" > integration-test-logs.txt || true
+          fi
+
+      - name: Upload integration test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-logs
+          path: integration-test-logs.txt
+          if-no-files-found: ignore
+
+      - name: Cleanup - Terminate temp EC2 instance
+        if: always()
+        run: |
+          if [ -n "${{ steps.ec2.outputs.INSTANCE_ID }}" ]; then
+            aws ec2 terminate-instances --instance-ids "${{ steps.ec2.outputs.INSTANCE_ID }}" || true
+            echo "✅ Terminated instance: ${{ steps.ec2.outputs.INSTANCE_ID }}"
+          fi
+
+      - name: Cleanup - Delete key pair
+        if: always()
+        run: |
+          if [ -n "${{ steps.ec2.outputs.KEY_NAME }}" ]; then
+            aws ec2 delete-key-pair --key-name "${{ steps.ec2.outputs.KEY_NAME }}" || true
+            rm -f test-key.pem || true
+            echo "✅ Deleted key pair: ${{ steps.ec2.outputs.KEY_NAME }}"
+          fi
+
+      - name: Cleanup - Delete security group
+        if: always()
+        run: |
+          if [ -n "${{ steps.security-group.outputs.SG_ID }}" ]; then
+            # Wait for instance termination before deleting security group
+            sleep 30
+            aws ec2 delete-security-group --group-id "${{ steps.security-group.outputs.SG_ID }}" || true
+            echo "✅ Deleted security group: ${{ steps.security-group.outputs.SG_ID }}"
+          fi
+
+      - name: Deploy to RC
+        id: deploy
+        if: success()
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.IMAGE_TAG }}
+        run: |
+          RC_IP=$(aws ec2 describe-instances --instance-ids "$RC_INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
+          chmod 600 key.pem
+          echo "#!/bin/bash" > deploy.sh
+          echo "set -e" >> deploy.sh
+          echo "aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com" >> deploy.sh
+          echo "sudo docker pull 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:$IMAGE_TAG" >> deploy.sh
+          echo "sudo docker stop color-app 2>/dev/null || true" >> deploy.sh
+          echo "sudo docker rm color-app 2>/dev/null || true" >> deploy.sh
+          echo "sudo docker run -d --name color-app -p 3000:3000 -e DB_HOST=${{ secrets.DB_HOST }} -e DB_USER=${{ secrets.DB_USER }} -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} -e DB_NAME=color_app_rc -e SESSION_SECRET=${{ secrets.SESSION_SECRET }} -e NODE_ENV=production --restart unless-stopped 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:$IMAGE_TAG" >> deploy.sh
+          scp -i key.pem -o StrictHostKeyChecking=no deploy.sh ec2-user@$RC_IP:/tmp/
+          ssh -i key.pem -o StrictHostKeyChecking=no ec2-user@$RC_IP "bash /tmp/deploy.sh"
+          rm -f key.pem
+
+      - name: Verify deployment
+        id: verify
+        if: success()
+        run: |
+          sleep 5
+          HEALTH=$(curl -sf https://rc.rahoi.dev/api/health || echo "failed")
+          if echo "$HEALTH" | grep -q '"status":"ok"'; then
+            echo "✅ RC deployment verified successfully"
+          else
+            echo "❌ RC deployment verification failed"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop test-app test-db 2>/dev/null || true
+          docker rm test-app test-db 2>/dev/null || true
+
+      - name: Create success summary
+        if: success()
+        run: |
+          echo "### ✅ RC Build and Deploy Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** ${{ steps.version.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow Run:** #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Quick Links:" >> $GITHUB_STEP_SUMMARY
+          echo "- [RC Environment](https://rc.rahoi.dev)" >> $GITHUB_STEP_SUMMARY
+          echo "- [View Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎉 Release candidate deployed successfully!" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create failure summary
+        if: failure()
+        run: |
+          echo "### ❌ RC Build Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow Run:** #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Stage Outcomes:" >> $GITHUB_STEP_SUMMARY
+          echo "- Checkout Infra: ${{ steps.checkout-infra.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Checkout Source: ${{ steps.checkout-source.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- AWS Credentials: ${{ steps.aws-credentials.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Quality Checks: ${{ steps.quality.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build: ${{ steps.build.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Smoke Tests: ${{ steps.smoke-test.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Push to ECR: ${{ steps.push-ecr.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Integration Tests: ${{ steps.integration-tests.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Comprehensive API Tests: ${{ steps.comprehensive-tests.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deploy to RC: ${{ steps.deploy.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Verify: ${{ steps.verify.outcome }}" >> $GITHUB_STEP_SUMMARY
+

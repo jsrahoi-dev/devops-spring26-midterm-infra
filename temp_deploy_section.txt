@@ -1,0 +1,23 @@
+          # Copy docker-compose file to EC2
+          scp -i test-key.pem -o StrictHostKeyChecking=no docker-compose.test.yml ec2-user@$PUBLIC_IP:~/app/docker-compose.yml
+
+          # Set variables for EC2
+          ECR_REG="${{ steps.login-ecr.outputs.registry }}"
+          IMG_TAG="${{ steps.version.outputs.IMAGE_TAG }}"
+
+          # Deploy on EC2
+          ssh -i test-key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP bash <<ENDSSH
+            cd ~/app
+            # Login to ECR
+            aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin $ECR_REG
+            # Set environment variables for docker-compose
+            export ECR_REGISTRY="$ECR_REG"
+            export ECR_REPOSITORY="color-perception-spa"
+            export IMAGE_TAG="$IMG_TAG"
+            # Pull and start services
+            sudo -E docker-compose pull
+            sudo -E docker-compose up -d
+            echo "⏳ Waiting for services to be healthy..."
+            sleep 30
+            sudo docker-compose ps
+ENDSSH
