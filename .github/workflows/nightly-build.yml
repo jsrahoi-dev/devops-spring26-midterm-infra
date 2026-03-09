@@ -236,7 +236,7 @@ jobs:
             }
 
       - name: Send email notification on failure
-        if: failure()
+        if: false  # Disabled - configure NOTIFICATION_EMAIL secret to enable
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
