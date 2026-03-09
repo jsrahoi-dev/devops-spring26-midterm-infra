@@ -104,7 +104,7 @@ jobs:
 
           # Test frontend loads
           echo "Testing frontend..."
-          curl -sf http://localhost:3000/ | grep -q "<!DOCTYPE html>" || exit 1
+          curl -sf http://localhost:3000/ | grep -iq "<!DOCTYPE html>" || exit 1
 
           echo "✅ All smoke tests passed!"
 
