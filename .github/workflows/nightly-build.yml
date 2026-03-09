@@ -143,6 +143,10 @@ jobs:
           echo "sleep 10" >> deploy.sh
           echo "echo Application logs:" >> deploy.sh
           echo "sudo docker logs color-app" >> deploy.sh
+          echo "echo Checking database tables..." >> deploy.sh
+          echo "sudo docker run --rm mysql:8 mysql -h ${{ secrets.DB_HOST }} -u ${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} color_app_qa -e \"SHOW TABLES;\"" >> deploy.sh
+          echo "sudo docker run --rm mysql:8 mysql -h ${{ secrets.DB_HOST }} -u ${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} color_app_qa -e \"DESCRIBE responses;\" || echo \"Table does not exist\"" >> deploy.sh
+
 
           scp -i key.pem -o StrictHostKeyChecking=no deploy.sh ec2-user@$QA_IP:/tmp/
 
