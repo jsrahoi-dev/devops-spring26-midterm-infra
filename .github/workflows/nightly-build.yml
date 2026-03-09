@@ -158,7 +158,7 @@ jobs:
           docker rm test-app test-db 2>/dev/null || true
 
       - name: Create issue on failure
-        if: failure() && secrets.NOTIFICATION_EMAIL != ''
+        if: failure()
         uses: actions/github-script@v7
         with:
           script: |
