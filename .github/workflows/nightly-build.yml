@@ -128,6 +128,11 @@ jobs:
           echo "#!/bin/bash" > deploy.sh
           echo "set -e" >> deploy.sh
           echo "aws ecr get-login-password --region us-east-2 | sudo docker login --username AWS --password-stdin 899088266694.dkr.ecr.us-east-2.amazonaws.com" >> deploy.sh
+          
+          # Create database if it does not exist
+          mysql -h ${{ secrets.DB_HOST }} -u ${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} -e "CREATE DATABASE IF NOT EXISTS color_app_qa;"
+          
+
           echo "sudo docker pull 899088266694.dkr.ecr.us-east-2.amazonaws.com/color-perception-spa:latest" >> deploy.sh
           echo "sudo docker stop color-app 2>/dev/null || true" >> deploy.sh
           echo "sudo docker rm color-app 2>/dev/null || true" >> deploy.sh
