@@ -158,7 +158,7 @@ jobs:
           docker rm test-app test-db 2>/dev/null || true
 
       - name: Create issue on failure
-        if: failure()
+        if: failure() && secrets.NOTIFICATION_EMAIL != ''
         uses: actions/github-script@v7
         with:
           script: |
@@ -238,7 +238,7 @@ jobs:
             }
 
       - name: Send email notification on failure
-        if: failure()
+        if: failure() && secrets.NOTIFICATION_EMAIL != ''
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -259,7 +259,6 @@ jobs:
             View logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             
             QA Environment: https://qa.rahoi.dev
-          ignore_missing_if: true
           convert_markdown: true
 
       - name: Post success summary
