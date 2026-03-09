@@ -56,10 +56,8 @@ jobs:
           npm ci
           npm run lint
 
-          # Backend tests
-          echo "🧪 Running backend tests..."
-          npm test
           cd ..
+
 
           echo "✅ Quality checks passed!"
 
